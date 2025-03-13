@@ -1,0 +1,197 @@
+// src/app/api/generate-questions/route.ts
+import { NextResponse } from 'next/server';
+import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+
+// Define the question interface
+interface Question {
+  question: string;
+  options: string[];
+  correctAnswer: string;
+}
+
+// Initialize OpenAI client
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+// Initialize Google Generative AI client
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-pro" });
+
+// Fallback questions if both APIs fail
+const fallbackQuestions: Question[] = [
+  {
+    question: "What is the chemical symbol for gold?",
+    options: ["Au", "Ag", "Fe", "Cu"],
+    correctAnswer: "Au"
+  },
+  {
+    question: "Which planet is known as the Red Planet?",
+    options: ["Mars", "Venus", "Jupiter", "Mercury"],
+    correctAnswer: "Mars"
+  },
+  {
+    question: "What is the process by which plants make their own food using sunlight?",
+    options: ["Photosynthesis", "Respiration", "Transpiration", "Germination"],
+    correctAnswer: "Photosynthesis"
+  },
+  {
+    question: "What is the largest organ in the human body?",
+    options: ["Skin", "Liver", "Heart", "Brain"],
+    correctAnswer: "Skin"
+  },
+  {
+    question: "Which of these is NOT a state of matter?",
+    options: ["Energy", "Solid", "Liquid", "Gas"],
+    correctAnswer: "Energy"
+  }
+];
+
+export async function POST(request: Request) {
+  try {
+    const { subject, difficulty, numberOfQuestions = 10 } = await request.json();
+
+    if (!subject || !difficulty) {
+      return NextResponse.json(
+        { error: 'Subject and difficulty are required' },
+        { status: 400 }
+      );
+    }
+
+    // First try OpenAI
+    try {
+      // Create a prompt for OpenAI to generate quiz questions
+      const prompt = `Generate ${numberOfQuestions} multiple-choice questions about ${subject} at a ${difficulty} difficulty level. 
+      Each question should have 4 options with only one correct answer.
+      Format the response as a JSON object with the following structure:
+      {
+        "questions": [
+          {
+            "question": "Question text",
+            "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+            "correctAnswer": "The correct option (must be exactly the same as one of the options)"
+          }
+        ]
+      }
+      Ensure the questions are appropriate for educational purposes and the difficulty level (${difficulty}) is maintained throughout.`;
+
+      console.log(`Generating questions about ${subject} at ${difficulty} level with OpenAI...`);
+      
+      // Call OpenAI API to generate questions
+      const response = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [
+          {
+            role: "system",
+            content: "You are an educational assistant that creates quiz questions based on subject and difficulty level."
+          },
+          {
+            role: "user",
+            content: prompt
+          }
+        ],
+        temperature: 0.7,
+        max_tokens: 2500,
+        response_format: { type: "json_object" }
+      });
+
+      // Extract and parse the generated questions
+      const content = response.choices[0].message.content;
+      if (!content) {
+        throw new Error('Failed to generate questions with OpenAI');
+      }
+
+      // Parse the JSON response
+      console.log('Parsing OpenAI response...');
+      const parsedContent = JSON.parse(content);
+      const questions = parsedContent.questions || [];
+
+      if (!Array.isArray(questions) || questions.length === 0) {
+        throw new Error('No questions in the OpenAI response');
+      }
+
+      console.log(`Successfully generated ${questions.length} questions with OpenAI`);
+      return NextResponse.json({ 
+        questions,
+        source: 'openai'
+      });
+    } 
+    catch (openaiError) {
+      // If OpenAI fails, try Gemini
+      console.error('Error using OpenAI API:', openaiError);
+      console.log('Falling back to Gemini API...');
+      
+      try {
+        // Create a prompt for Gemini
+        const geminiPrompt = `Generate ${numberOfQuestions} multiple-choice questions about ${subject} at a ${difficulty} difficulty level. 
+        Each question should have 4 options with only one correct answer.
+        Format the response as a JSON object with the following structure:
+        {
+          "questions": [
+            {
+              "question": "Question text",
+              "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
+              "correctAnswer": "The correct option (must be exactly the same as one of the options)"
+            }
+          ]
+        }
+        Keep the questions educational and appropriate for the difficulty level.`;
+
+        console.log(`Generating questions about ${subject} at ${difficulty} level with Gemini...`);
+        
+        // Call Gemini API to generate questions
+        const result = await geminiModel.generateContent(geminiPrompt);
+        const response = await result.response;
+        const content = response.text();
+
+        if (!content) {
+          throw new Error('Failed to generate questions with Gemini');
+        }
+
+        // Parse the JSON response
+        try {
+          // Clean the response to ensure it's valid JSON by removing code blocks if present
+          const cleanedContent = content.replace(/```json|```/g, '').trim();
+          
+          console.log('Parsing Gemini response...');
+          const parsedContent = JSON.parse(cleanedContent);
+          const questions = parsedContent.questions || [];
+
+          if (!Array.isArray(questions) || questions.length === 0) {
+            throw new Error('No questions in the Gemini response');
+          }
+
+          console.log(`Successfully generated ${questions.length} questions with Gemini`);
+          return NextResponse.json({ 
+            questions,
+            source: 'gemini'
+          });
+        } catch (parseError) {
+          console.error('Error parsing Gemini response:', parseError);
+          throw new Error('Failed to parse Gemini response');
+        }
+      } catch (geminiError) {
+        // If both APIs fail, use fallback questions
+        console.error('Error using Gemini API:', geminiError);
+        console.log('Using fallback questions...');
+        
+        // Limit the number of questions to the requested amount
+        const limitedFallbackQuestions = fallbackQuestions.slice(0, Math.min(numberOfQuestions, fallbackQuestions.length));
+        
+        return NextResponse.json({ 
+          questions: limitedFallbackQuestions,
+          source: 'fallback'
+        });
+      }
+    }
+  } catch (error) {
+    console.error('Error in generate-questions API route:', error);
+    
+    // Final fallback - return some basic questions if everything else fails
+    return NextResponse.json({ 
+      questions: fallbackQuestions.slice(0, 5),
+      source: 'error-fallback'
+    }, { status: 200 }); // Return 200 status with fallback data instead of 500
+  }
+}
